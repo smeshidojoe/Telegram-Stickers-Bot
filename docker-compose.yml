@@ -1,0 +1,45 @@
+services:
+  bot:
+    build: .
+    image: stickerbot:latest
+    container_name: stickerbot
+
+    # Токен и прочие настройки — из .env, в образ они не попадают.
+    env_file: .env
+
+    restart: unless-stopped
+
+    # tini как PID 1, чтобы подбирать процессы ffmpeg, осиротевшие при
+    # аварийном завершении. На скорость docker stop не влияет: корректное
+    # выключение обеспечивает сам aiogram, он вешает обработчик SIGTERM.
+    init: true
+
+    # Успеть дорезать текущий стикер перед остановкой.
+    stop_grace_period: 30s
+
+    # reverse держит фрагмент в памяти (~1 МБ на кадр 512x512 RGBA),
+    # при двух параллельных задачах пик заметный.
+    mem_limit: 2g
+    cpus: 2.0
+
+    # Рабочие файлы наружу контейнерного слоя; при старте бот их подчищает.
+    volumes:
+      - tmp:/app/tmp
+
+    # Иначе логи растут без предела.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # GPU ускоряет только декод исходника: VP9 с альфа-каналом не умеет
+    # кодировать ни один GPU-энкодер, так что энкод в любом случае на CPU.
+    # NVIDIA (нужен NVIDIA Container Toolkit на хосте):
+    # gpus: all
+    # Intel/AMD через VAAPI:
+    # devices:
+    #   - /dev/dri:/dev/dri
+
+volumes:
+  tmp:

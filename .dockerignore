@@ -1,0 +1,17 @@
+# Секрет передаём через окружение, в образ он попадать не должен.
+.env
+
+tmp/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+Dockerfile
+.dockerignore
+
+# сборочный контекст держим лёгким
+docker-compose.yml
+README.md
+.env.example
