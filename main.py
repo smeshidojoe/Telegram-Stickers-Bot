@@ -59,8 +59,14 @@ EFFECT_MAX_SECONDS = 10.0
 EFFECTS = ["none", "reverse", "boomerang"]
 EFFECT_LABELS = {"none": "нет", "reverse": "реверс", "boomerang": "бумеранг"}
 
+# Квадрат обходится без маски и без альфы — значит вдвое меньше памяти на
+# reverse (yuv420p против rgba). По весу файла он, наоборот, чуть тяжелее
+# круга: у круга прозрачные углы кодируются почти бесплатно.
+SHAPES = ["circle", "square"]
+SHAPE_LABELS = {"circle": "круг", "square": "квадрат"}
+
 STICKER_EMOJI = "🎬"
-PACK_TITLE = "Круглые стикеры"
+PACK_TITLE = "Стикеры из видео"
 
 # Лестница качества: поднимаем crf / роняем fps, пока не влезем в 256 КБ.
 QUALITY_LADDER = [(32, 30), (40, 30), (48, 24), (56, 20), (63, 15)]
@@ -111,6 +117,9 @@ class Session:
     start: float = 0.0
     length: float = 0.0
     effect: str = "none"
+    shape: str = "circle"
+    # Какая панель сейчас под сообщением — чтобы перерисовать именно её.
+    panel: str = "mode"
     sticker_file_id: str | None = None
     created_at: float = field(default_factory=time.monotonic)
 
@@ -270,7 +279,7 @@ CROP_CHAIN = (
     "fps={fps},"
     "scale={side}:{side}:force_original_aspect_ratio=increase,"
     "crop={side}:{side},"
-    "format=rgba"
+    "format={pix}"
 )
 
 
@@ -311,30 +320,51 @@ def build_command(
     if hwaccel:
         cmd += ["-hwaccel", hwaccel]
 
-    filters = (
-        "[0:v]{crop},{tail};"
-        "[1:v]format=gray,scale={side}:{side}[m];"
-        # shortest=0 + repeatlast=1 (дефолт): однокадровая маска
-        # растягивается на всё видео и не обрывает его.
-        "[v][m]alphamerge,format=yuva420p[o]"
-    ).format(
-        crop=CROP_CHAIN.format(fps=fps, side=STICKER_SIDE),
-        tail=effect_chain(session.effect, speed_factor(session.pct)),
-        side=STICKER_SIDE,
-    )
+    square = session.shape == "square"
+
+    # Внутри цепочки кругу нужен rgba под alphamerge, а энкодеру — yuva420p.
+    # Подставить сюда rgba нельзя: libvpx-vp9 его не умеет и молча
+    # откатывается на yuv420p, то есть выбрасывает альфу.
+    filter_pix = "yuv420p" if square else "rgba"
+    encode_pix = "yuv420p" if square else "yuva420p"
+
+    crop = CROP_CHAIN.format(fps=fps, side=STICKER_SIDE, pix=filter_pix)
+    tail = effect_chain(session.effect, speed_factor(session.pct))
+
+    if square:
+        # Кадр уже квадратный, прозрачность не нужна — ни маски, ни alphamerge.
+        filters = "[0:v]{0},{1}".format(crop, tail)
+    else:
+        filters = (
+            "[0:v]{crop},{tail};"
+            "[1:v]format=gray,scale={side}:{side}[m];"
+            # shortest=0 + repeatlast=1 (дефолт): однокадровая маска
+            # растягивается на всё видео и не обрывает его.
+            "[v][m]alphamerge,format=yuva420p[a]"
+        ).format(crop=crop, tail=tail, side=STICKER_SIDE)
 
     cmd += [
         # -ss и -t до -i: ffmpeg перематывает, а не декодирует всё подряд.
         "-ss", "{0:.3f}".format(session.start),
         "-t", "{0:.3f}".format(session.length),
         "-i", session.input_path,
-        "-i", MASK_PATH,
+    ]
+
+    if not square:
+        cmd += ["-i", MASK_PATH]
+
+    cmd += [
         "-filter_complex", filters,
-        "-map", "[o]",
+        "-map", "[v]" if square else "[a]",
         "-an",
         "-c:v", "libvpx-vp9",
-        "-pix_fmt", "yuva420p",
-        "-auto-alt-ref", "0",   # обязательно для VP9 с альфой
+        "-pix_fmt", encode_pix,
+    ]
+
+    if not square:
+        cmd += ["-auto-alt-ref", "0"]   # обязательно для VP9 с альфой
+
+    cmd += [
         "-crf", str(crf),
         "-b:v", "0",
         "-row-mt", "1",
@@ -378,34 +408,47 @@ async def convert(session: Session, output_path: str) -> None:
 
 
 async def render_preview(session: Session) -> str:
-    """Один кадр с начала фрагмента: круг поверх шашечек.
+    """Один кадр с начала фрагмента: для круга — поверх шашечек.
 
     PNG уйдёт фотографией, а фотографии Telegram расплющивает в JPEG,
     так что прозрачность подкладываем сами — иначе был бы чёрный квадрат.
+    У квадрата прозрачных мест нет, подкладка не нужна.
     """
     await ensure_assets()
 
     path = os.path.join(session.job_dir, "preview.png")
 
-    filters = (
-        "[0:v]scale={side}:{side}:force_original_aspect_ratio=increase,"
-        "crop={side}:{side},format=rgba[v];"
-        "[1:v]format=gray,scale={side}:{side}[m];"
-        "[v][m]alphamerge[fg];"
-        "[2:v][fg]overlay=0:0:format=auto,format=rgb24[o]"
+    crop = (
+        "scale={side}:{side}:force_original_aspect_ratio=increase,"
+        "crop={side}:{side}"
     ).format(side=STICKER_SIDE)
 
-    code, err = await run([
+    cmd = [
         "ffmpeg", "-y", "-v", "error",
         "-ss", "{0:.3f}".format(session.start),
         "-i", session.input_path,
-        "-i", MASK_PATH,
-        "-i", CHECKER_PATH,
-        "-filter_complex", filters,
-        "-map", "[o]",
-        "-frames:v", "1",
-        path,
-    ], timeout=60.0)
+    ]
+
+    if session.shape == "square":
+        cmd += ["-vf", crop + ",format=rgb24"]
+    else:
+        filters = (
+            "[0:v]{crop},format=rgba[v];"
+            "[1:v]format=gray,scale={side}:{side}[m];"
+            "[v][m]alphamerge[fg];"
+            "[2:v][fg]overlay=0:0:format=auto,format=rgb24[o]"
+        ).format(crop=crop, side=STICKER_SIDE)
+
+        cmd += [
+            "-i", MASK_PATH,
+            "-i", CHECKER_PATH,
+            "-filter_complex", filters,
+            "-map", "[o]",
+        ]
+
+    cmd += ["-frames:v", "1", path]
+
+    code, err = await run(cmd, timeout=60.0)
 
     if code != 0:
         raise RuntimeError("превью не получилось: " + err.strip()[-400:])
@@ -462,8 +505,17 @@ def pct_to_fit(session: Session) -> int:
 # --------------------------------------------------------------------------
 
 
-def mode_keyboard(sid: str) -> InlineKeyboardMarkup:
+def shape_button(sid: str, session: Session) -> InlineKeyboardButton:
+    """Переключатель формы: показывает текущую, по клику берёт следующую."""
+    return InlineKeyboardButton(
+        text="Форма: " + SHAPE_LABELS[session.shape],
+        callback_data="h:" + sid,
+    )
+
+
+def mode_keyboard(sid: str, session: Session) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [shape_button(sid, session)],
         [
             InlineKeyboardButton(text="Обычная", callback_data="go:" + sid),
             InlineKeyboardButton(text="Настроить", callback_data="custom:" + sid),
@@ -502,7 +554,8 @@ def settings_keyboard(sid: str, session: Session) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text="Эффект: " + EFFECT_LABELS[session.effect],
             callback_data="e:" + sid,
-        )
+        ),
+        shape_button(sid, session),
     ])
 
     rows.append([
@@ -522,6 +575,7 @@ def pack_keyboard(sid: str) -> InlineKeyboardMarkup:
 def mode_text(session: Session) -> str:
     lines = [
         "Длина видео: " + fmt(session.duration),
+        "Форма: {0}.".format(SHAPE_LABELS[session.shape]),
         "На превью — первый кадр будущего стикера.",
         "",
         "Какая будет скорость?",
@@ -546,7 +600,9 @@ def settings_text(session: Session) -> str:
         "Фрагмент: {0:.1f}–{1:.1f} с из {2}".format(
             session.start, session.start + session.length, fmt(session.duration)
         ),
-        "Эффект: " + EFFECT_LABELS[session.effect],
+        "Эффект: {0}, форма: {1}".format(
+            EFFECT_LABELS[session.effect], SHAPE_LABELS[session.shape]
+        ),
         "",
         "Исходная длина: " + fmt(session.length),
         "Выходная длина: " + fmt(result),
@@ -573,10 +629,11 @@ def settings_text(session: Session) -> str:
 @dp.message(Command("help"))
 async def handle_start(message: Message):
     await message.answer(
-        "Пришли видео или кружок — верну круглый видеостикер.\n\n"
-        "Перед конвертацией покажу превью и спрошу скорость. "
-        "В «Настроить» есть шаг 5% по скорости, обрезка фрагмента, "
-        "реверс и бумеранг. Готовый стикер можно добавить в свой пак."
+        "Пришли видео или кружок — верну видеостикер, круглый или квадратный.\n\n"
+        "Перед конвертацией покажу превью и спрошу скорость. Форма "
+        "переключается кнопкой. В «Настроить» есть шаг 5% по скорости, "
+        "обрезка фрагмента, реверс и бумеранг. "
+        "Готовый стикер можно добавить в свой пак."
     )
 
 
@@ -632,7 +689,7 @@ async def start_session(message: Message, file_id: str, file_size: int | None):
     await message.answer_photo(
         FSInputFile(preview),
         caption=mode_text(session),
-        reply_markup=mode_keyboard(sid),
+        reply_markup=mode_keyboard(sid, session),
     )
 
 
@@ -680,8 +737,12 @@ async def refresh(
     Кадр перекодируем только когда сдвинулся старт: на смене скорости или
     эффекта картинка та же, хватает правки подписи.
     """
-    text = settings_text(session)
-    markup = settings_keyboard(sid, session)
+    if session.panel == "settings":
+        text = settings_text(session)
+        markup = settings_keyboard(sid, session)
+    else:
+        text = mode_text(session)
+        markup = mode_keyboard(sid, session)
 
     try:
         if new_frame:
@@ -706,6 +767,8 @@ async def on_custom(callback: CallbackQuery):
     if not session:
         await callback.answer("Сессия устарела, пришли видео заново.", show_alert=True)
         return
+
+    session.panel = "settings"
 
     await refresh(callback, sid, session, new_frame=False)
     await callback.answer()
@@ -798,6 +861,22 @@ async def on_effect(callback: CallbackQuery):
 
     await refresh(callback, sid, session, new_frame=False)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("h:"))
+async def on_shape(callback: CallbackQuery):
+    sid = callback.data.split(":")[1]
+    session = get_session(sid)
+
+    if not session:
+        await callback.answer("Сессия устарела, пришли видео заново.", show_alert=True)
+        return
+
+    session.shape = SHAPES[(SHAPES.index(session.shape) + 1) % len(SHAPES)]
+
+    # Кадрирование то же, но у круга превью лежит на шашечках — кадр нужен новый.
+    await refresh(callback, sid, session, new_frame=True)
+    await callback.answer(SHAPE_LABELS[session.shape])
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
@@ -928,7 +1007,7 @@ async def on_pack(callback: CallbackQuery):
 
 @dp.message()
 async def handle_other(message: Message):
-    await message.answer("Пришли видео или кружок — сделаю круглый стикер.")
+    await message.answer("Пришли видео или кружок — сделаю из него стикер.")
 
 
 async def heartbeat_loop():
